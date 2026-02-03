@@ -1,0 +1,27 @@
+{
+  "SEQ_LEN": 6,
+  "ERA_FEATURES": [
+    "tp",
+    "ssrd",
+    "e",
+    "pev",
+    "u10",
+    "v10",
+    "d2m",
+    "t2m",
+    "sp",
+    "stl1",
+    "stl2",
+    "swvl2",
+    "swvl3"
+  ],
+  "EARTH_FEATURES": [
+    "NDVI_mean",
+    "LST_Day_C",
+    "LST_Night_C",
+    "LST_mean_C",
+    "VCI",
+    "TCI",
+    "VHI"
+  ]
+}

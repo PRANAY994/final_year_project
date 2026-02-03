@@ -1,0 +1,9 @@
+[
+  "NDVI_mean",
+  "LST_Day_C",
+  "LST_Night_C",
+  "LST_mean_C",
+  "VCI",
+  "TCI",
+  "VHI"
+]
