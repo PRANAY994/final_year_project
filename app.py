@@ -11,6 +11,7 @@ import numpy as np
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import json
 import os
+import joblib
 
 # Try to import tensorflow/keras for model loading
 try:
@@ -386,11 +387,65 @@ def load_predictions(path: Path):
         else:
             # Create a dummy time column if none exists
             df['time'] = pd.to_datetime('2019-01-01')
+
+        # Normalize prediction column names to expected `y_true` and `y_pred`
+        col_map = {}
+        if 'spei_true' in df.columns and 'spei_pred' in df.columns:
+            col_map['spei_true'] = 'y_true'
+            col_map['spei_pred'] = 'y_pred'
+        # common alternatives
+        if 'true' in df.columns and 'pred' in df.columns:
+            col_map.setdefault('true', 'y_true')
+            col_map.setdefault('pred', 'y_pred')
+        if 'actual' in df.columns and 'predicted' in df.columns:
+            col_map.setdefault('actual', 'y_true')
+            col_map.setdefault('predicted', 'y_pred')
+        # apply mapping
+        if col_map:
+            df = df.rename(columns=col_map)
+
+        # Ensure expected columns exist and provide sensible defaults
+        if 'y_true' not in df.columns and 'y_pred' not in df.columns:
+            # nothing to plot; return as-is
+            pass
+
+        # Add a model column if missing (use filename stem)
+        if 'model' not in df.columns:
+            try:
+                df['model'] = path.stem
+            except Exception:
+                df['model'] = 'model'
         
         return df
     except Exception as e:
         st.error(f"Error loading {path.name}: {str(e)}")
         return None
+
+
+@st.cache_data
+def load_training_data():
+    """Load original dataset used for training (SPEI series)."""
+    try:
+        data_path = APP_DIR / "datasets" / "early_fusion_dataset.csv"
+        if not data_path.exists():
+            return pd.DataFrame()
+        tdf = pd.read_csv(data_path)
+        # normalize column names
+        tdf.columns = [c.lower().strip() for c in tdf.columns]
+        if 'valid_time' in tdf.columns:
+            tdf['time'] = pd.to_datetime(tdf['valid_time'])
+        elif 'time' in tdf.columns:
+            tdf['time'] = pd.to_datetime(tdf['time'])
+        # target column name in dataset is 'spei6_new'
+        if 'spei6_new' in tdf.columns:
+            tdf['y_train'] = tdf['spei6_new']
+        else:
+            # fallback: try SPEI column
+            tdf['y_train'] = tdf.get('spei', np.nan)
+        return tdf
+    except Exception as e:
+        st.warning(f"Could not load training dataset: {e}")
+        return pd.DataFrame()
 
 @st.cache_resource
 def load_model(model_path):
@@ -402,6 +457,30 @@ def load_model(model_path):
         return None
     except Exception as e:
         st.warning(f"Could not load model: {str(e)}")
+        return None
+
+
+@st.cache_resource
+def load_xgb_model(model_path):
+    """Load a joblib XGBoost model if present"""
+    try:
+        if model_path.exists():
+            return joblib.load(str(model_path))
+        return None
+    except Exception as e:
+        st.warning(f"Could not load XGBoost model: {str(e)}")
+        return None
+
+
+@st.cache_resource
+def load_feature_names(path):
+    """Load feature names (joblib) used by the XGBoost model"""
+    try:
+        if path.exists():
+            return joblib.load(str(path))
+        return None
+    except Exception as e:
+        st.warning(f"Could not load feature names: {str(e)}")
         return None
 
 # =========================================================
@@ -456,32 +535,122 @@ def plot_timeseries(df, location_lat=None, location_lon=None):
     
     df = df.sort_values('time')
     
+    # attempt to load training series (original dataset)
+    train_df = load_training_data()
+
     fig = go.Figure()
-    
-    # Add predictions
-    fig.add_trace(
-        go.Scatter(
-            x=df['time'],
-            y=df['y_pred'],
-            mode='lines+markers',
-            name='Predicted SPEI',
-            line=dict(color='#1f77b4', width=2),
-            marker=dict(size=5)
+
+    # Determine training and validation cutoffs (training: <=2015, validation: 2016-2018)
+    train_cutoff = pd.Timestamp('2015-12-31')
+    val_cutoff = pd.Timestamp('2018-12-31')
+
+    # Plot training + validation series from original dataset if available
+    if not train_df.empty and location_lat is not None and location_lon is not None:
+        tloc = train_df[(train_df['latitude'] == location_lat) & (train_df['longitude'] == location_lon)].copy()
+        if not tloc.empty:
+            tloc = tloc.sort_values('time')
+            t_train = tloc[tloc['time'] <= train_cutoff]
+            t_val = tloc[(tloc['time'] > train_cutoff) & (tloc['time'] <= val_cutoff)]
+            if not t_train.empty:
+                fig.add_trace(
+                    go.Scatter(
+                        x=t_train['time'],
+                        y=t_train['y_train'],
+                        mode='lines+markers',
+                        name='Training (Actual SPEI)',
+                        line=dict(color='gray', width=2),
+                        marker=dict(size=4),
+                        hovertemplate='%{x|%Y-%m-%d}: %{y:.3f}<extra>Training</extra>'
+                    )
+                )
+            if not t_val.empty:
+                fig.add_trace(
+                    go.Scatter(
+                        x=t_val['time'],
+                        y=t_val['y_train'],
+                        mode='lines+markers',
+                        name='Validation (Actual SPEI)',
+                        line=dict(color='lightgray', width=2, dash='dot'),
+                        marker=dict(size=4),
+                        hovertemplate='%{x|%Y-%m-%d}: %{y:.3f}<extra>Validation</extra>'
+                    )
+                )
+
+    # Add red vertical separator at the end of validation using a shape (datetime-safe)
+    cutoff_str = str(val_cutoff)
+    fig.add_shape(
+        dict(
+            type="line",
+            xref="x",
+            yref="paper",
+            x0=cutoff_str,
+            x1=cutoff_str,
+            y0=0,
+            y1=1,
+            line=dict(color='red', width=2, dash='dash')
         )
     )
-    
-    # Add ground truth
-    fig.add_trace(
-        go.Scatter(
-            x=df['time'],
-            y=df['y_true'],
-            mode='lines+markers',
-            name='Actual SPEI',
-            line=dict(color='#ff7f0e', width=2, dash='dot'),
-            marker=dict(size=5)
-        )
+
+    fig.add_annotation(
+        x=cutoff_str,
+        y=1.02,
+        xref='x',
+        yref='paper',
+        text='Train/Test Split',
+        showarrow=False,
+        xanchor='left',
+        font=dict(color='red')
     )
-    
+
+    # Plot post-training actual and predicted from the predictions dataframe
+    post_df = df[df['time'] > train_cutoff]
+    # If there is any pre-split data in the predictions df (rare), we still plot it as 'Actual (full)'
+    if not df.empty and (df['time'] <= train_cutoff).any():
+        pre_df = df[df['time'] <= train_cutoff]
+        fig.add_trace(
+            go.Scatter(
+                x=pre_df['time'],
+                y=pre_df['y_true'],
+                mode='lines+markers',
+                name='Actual (Full)',
+                line=dict(color='#ff7f0e', width=2, dash='dot'),
+                marker=dict(size=5)
+            )
+        )
+
+    if not post_df.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=post_df['time'],
+                y=post_df['y_true'],
+                mode='lines+markers',
+                name='Actual (Post-Train)',
+                line=dict(color='#ff7f0e', width=2),
+                marker=dict(size=6)
+            )
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=post_df['time'],
+                y=post_df['y_pred'],
+                mode='lines+markers',
+                name='Predicted (Post-Train)',
+                line=dict(color='#1f77b4', width=2),
+                marker=dict(size=6)
+            )
+        )
+
+    # If no training dataset was available, fall back to previous behavior (plot all actual & pred)
+    if train_df.empty:
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(x=df['time'], y=df['y_pred'], mode='lines+markers', name='Predicted SPEI', line=dict(color='#1f77b4', width=2), marker=dict(size=5))
+        )
+        fig.add_trace(
+            go.Scatter(x=df['time'], y=df['y_true'], mode='lines+markers', name='Actual SPEI', line=dict(color='#ff7f0e', width=2, dash='dot'), marker=dict(size=5))
+        )
+
     title = f"SPEI Time Series (Lat: {location_lat:.1f}, Lon: {location_lon:.1f})" if location_lat else "SPEI Time Series"
     fig.update_layout(
         title=title,
@@ -530,6 +699,106 @@ def plot_error_distribution(df):
         opacity=0.7
     )
     fig.update_layout(height=600, template='plotly_white')
+    return fig
+
+
+def plot_spatial_error_map(df):
+    """Map showing mean absolute error per location (lat/lon)."""
+    df2 = df.copy()
+    if 'latitude' not in df2.columns or 'longitude' not in df2.columns:
+        return None
+
+    df2['abs_error'] = np.abs(df2['y_true'] - df2['y_pred'])
+    grouped = (
+        df2.groupby(['latitude', 'longitude'], as_index=False)
+        .agg(mean_abs_error=('abs_error', 'mean'), samples=('y_true', 'size'))
+    )
+
+    if grouped.empty:
+        return None
+
+    fig = px.scatter_mapbox(
+        grouped,
+        lat='latitude',
+        lon='longitude',
+        color='mean_abs_error',
+        size='mean_abs_error',
+        hover_data=['mean_abs_error', 'samples'],
+        color_continuous_scale='RdYlGn_r',
+        title='Mean Absolute Error by Location',
+        size_max=18,
+        zoom=2
+    )
+    fig.update_layout(mapbox_style='open-street-map', height=600)
+    return fig
+
+
+def plot_error_overview(df):
+    """Single combined figure: spatial map (mean abs error) + error distribution histogram."""
+    import plotly.subplots as sp
+
+    df2 = df.copy()
+    if 'latitude' not in df2.columns or 'longitude' not in df2.columns:
+        return plot_error_distribution(df2)
+
+    df2['abs_error'] = np.abs(df2['y_true'] - df2['y_pred'])
+    grouped = (
+        df2.groupby(['latitude', 'longitude'], as_index=False)
+        .agg(mean_abs_error=('abs_error', 'mean'), samples=('y_true', 'size'), std_error=('abs_error', 'std'))
+    )
+
+    # create subplots: map (left) + histogram (right)
+    fig = sp.make_subplots(rows=1, cols=2, column_widths=[0.68, 0.32], specs=[[{"type": "mapbox"}, {"type": "xy"}]], horizontal_spacing=0.02)
+
+    # map trace
+    if not grouped.empty:
+        fig.add_trace(
+            go.Scattermapbox(
+                lat=grouped['latitude'],
+                lon=grouped['longitude'],
+                mode='markers',
+                marker=go.scattermapbox.Marker(
+                    size=np.clip(grouped['mean_abs_error'] * 8, 6, 30),
+                    color=grouped['mean_abs_error'],
+                    colorscale='RdYlGn_r',
+                    showscale=True,
+                    colorbar=dict(title='Mean |Error|')
+                ),
+                hovertemplate='Lat: %{lat}<br>Lon: %{lon}<br>Mean |err|: %{marker.color:.3f}<br>Samples: %{customdata[0]}<extra></extra>',
+                customdata=np.stack([grouped['samples'].values, grouped['mean_abs_error'].values, grouped['std_error'].fillna(0).values], axis=1),
+                name='Mean Abs Error'
+            ),
+            row=1, col=1
+        )
+
+    # histogram of absolute errors (all points)
+    fig.add_trace(
+        go.Histogram(
+            x=df2['abs_error'],
+            nbinsx=50,
+            marker_color='indianred',
+            name='Absolute Error Distribution',
+            opacity=0.8
+        ),
+        row=1, col=2
+    )
+
+    # layout for mapbox - center on data
+    if not grouped.empty:
+        center = dict(lat=grouped['latitude'].mean(), lon=grouped['longitude'].mean())
+    else:
+        center = dict(lat=df2['latitude'].mean(), lon=df2['longitude'].mean()) if 'latitude' in df2.columns else dict(lat=0, lon=0)
+
+    fig.update_layout(
+        mapbox=dict(style='open-street-map', center=center, zoom=3),
+        height=600,
+        title='Spatial Error Overview — Map (left) + Error Distribution (right)'
+    )
+
+    # tidy axes for histogram
+    fig.update_xaxes(title_text='Absolute Error', row=1, col=2)
+    fig.update_yaxes(title_text='Count', row=1, col=2)
+
     return fig
 
 def plot_metrics_radar(metrics_dict):
@@ -758,14 +1027,130 @@ elif page == "🔍 Model Predictions":
         """)
     
     with tab4:
-        st.subheader("Error Distribution")
-        st.plotly_chart(plot_error_distribution(df), use_container_width=True)
+        st.subheader("Error Distribution & Spatial Hotspots")
+        # Compute spatial error stats
+        df_err = df.copy()
+        df_err['abs_error'] = np.abs(df_err['y_true'] - df_err['y_pred'])
+        spatial_stats = (
+            df_err.groupby(['latitude', 'longitude'], as_index=False)
+            .agg(
+                mean_error=('abs_error', 'mean'),
+                max_error=('abs_error', 'max'),
+                min_error=('abs_error', 'min'),
+                std_error=('abs_error', 'std'),
+                samples=('y_true', 'size')
+            )
+        )
+        
+        # Single unified map with all error details
+        fig = px.scatter_mapbox(
+            spatial_stats,
+            lat='latitude',
+            lon='longitude',
+            color='mean_error',
+            size='mean_error',
+            hover_data={
+                'latitude': ':.2f',
+                'longitude': ':.2f',
+                'mean_error': ':.4f',
+                'max_error': ':.4f',
+                'min_error': ':.4f',
+                'std_error': ':.4f',
+                'samples': True
+            },
+            color_continuous_scale='RdYlGn_r',
+            title='Error Distribution by Location (Size & Color = Mean Absolute Error)',
+            size_max=25,
+            zoom=2,
+            center={'lat': spatial_stats['latitude'].mean(), 'lon': spatial_stats['longitude'].mean()}
+        )
+        fig.update_layout(mapbox_style='open-street-map', height=700)
+        st.plotly_chart(fig, use_container_width=True)
+        
         st.info("""
         💡 **How to interpret:**
-        - Left-skewed distribution = consistently accurate
-        - Right tail = occasional large errors
-        - Multiple peaks = different error modes
+        - **Color & Size**: Darker red = higher mean absolute error; larger circles = higher error
+        - **Hover**: Shows mean, max, min, std deviation of errors & sample count at each location
+        - **High-error zones** (red hotspots) indicate regions where the model struggles most
         """)
+        
+        st.markdown("---")
+        st.subheader("📊 Detailed Error Visualization by Location & SPEI Values")
+        
+        # Create comprehensive scatter plot with all information
+        df_detailed = df.copy()
+        df_detailed['error'] = np.abs(df_detailed['y_true'] - df_detailed['y_pred'])
+        
+        # Sort by error descending
+        df_detailed = df_detailed.sort_values('error', ascending=False).reset_index(drop=True)
+        
+        # Create scatter plot: Latitude vs Error, with Longitude as color, size as error magnitude
+        fig_detailed = px.scatter(
+            df_detailed,
+            x='latitude',
+            y='error',
+            color='longitude',
+            size='error',
+            hover_data={
+                'latitude': ':.2f',
+                'longitude': ':.2f',
+                'y_true': ':.4f',
+                'y_pred': ':.4f',
+                'error': ':.4f',
+                'time': True
+            },
+            labels={
+                'latitude': 'Latitude',
+                'error': 'Absolute Error',
+                'y_true': 'Actual SPEI',
+                'y_pred': 'Predicted SPEI',
+                'longitude': 'Longitude'
+            },
+            color_continuous_scale='Viridis',
+            title='Error Distribution: Latitude vs Error (size & hover show all details)',
+            height=600
+        )
+        fig_detailed.update_layout(template='plotly_white')
+        st.plotly_chart(fig_detailed, use_container_width=True)
+        
+        st.write("**Hover over points to see: Latitude, Longitude, Actual SPEI, Predicted SPEI, Error, and Time**")
+        
+        st.markdown("---")
+        
+        # Alternative view: Actual vs Predicted with error coloring
+        fig_alt = px.scatter(
+            df_detailed,
+            x='y_true',
+            y='y_pred',
+            color='error',
+            size='error',
+            hover_data={
+                'latitude': ':.2f',
+                'longitude': ':.2f',
+                'y_true': ':.4f',
+                'y_pred': ':.4f',
+                'error': ':.4f'
+            },
+            labels={
+                'y_true': 'Actual SPEI',
+                'y_pred': 'Predicted SPEI',
+                'error': 'Absolute Error'
+            },
+            color_continuous_scale='RdYlGn_r',
+            title='Actual vs Predicted SPEI (colored & sized by error; high error = red & large)',
+            height=600
+        )
+        # Add diagonal line for perfect prediction
+        min_val = min(df_detailed['y_true'].min(), df_detailed['y_pred'].min())
+        max_val = max(df_detailed['y_true'].max(), df_detailed['y_pred'].max())
+        fig_alt.add_trace(
+            go.Scatter(x=[min_val, max_val], y=[min_val, max_val], mode='lines', 
+                      name='Perfect Prediction', line=dict(color='black', dash='dash', width=2))
+        )
+        fig_alt.update_layout(template='plotly_white')
+        st.plotly_chart(fig_alt, use_container_width=True)
+        
+        st.write("**Points far from diagonal = high error; hover to see latitude, longitude, and error details**")
     
     with tab5:
         st.subheader("Prediction Data Table")
@@ -900,7 +1285,7 @@ elif page == "📈 Performance Analysis":
 # PAGE 4: SPATIAL ANALYSIS
 # =========================================================
 elif page == "🗺️ Spatial Analysis":
-    st.header("🗺️ Geographic Performance Analysis")
+    st.header("🗺️ Spatial-Temporal Analysis")
     
     model_name = st.selectbox("📍 Select Model", list(PREDICTION_FILES.keys()))
     df = load_predictions(PREDICTION_FILES[model_name])
@@ -909,62 +1294,45 @@ elif page == "🗺️ Spatial Analysis":
         st.error("Prediction file not found")
         st.stop()
     
-    # Compute spatial metrics
-    spatial_data = []
-    for (lat, lon), group in df.groupby(['latitude', 'longitude']):
-        metrics = compute_metrics(group['y_true'], group['y_pred'])
-        metrics['latitude'] = lat
-        metrics['longitude'] = lon
-        spatial_data.append(metrics)
+    # Line plot: Predicted SPEI over time for each location
+    df_time = df.copy()
+    df_time = df_time.sort_values('time')
     
-    spatial_df = pd.DataFrame(spatial_data)
+    # Create location label (lat/lon)
+    df_time['location'] = df_time['latitude'].round(2).astype(str) + '°N, ' + df_time['longitude'].round(2).astype(str) + '°E'
     
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        metric_choice = st.selectbox(
-            "📊 Metric to Display",
-            ['RMSE', 'MAE', 'R²', 'MAPE']
-        )
-    with col2:
-        size_metric = st.selectbox(
-            "📏 Size indicator",
-            ['RMSE', 'MAE', 'MAPE', 'None']
-        )
-    
-    # Create map
-    size_col = None if size_metric == 'None' else size_metric
-    
-    fig = px.scatter_mapbox(
-        spatial_df,
-        lat='latitude',
-        lon='longitude',
-        color=metric_choice,
-        size=size_col,
-        hover_data=['RMSE', 'MAE', 'R²', 'MAPE'],
-        color_continuous_scale='RdYlGn_r' if metric_choice != 'R²' else 'Greens',
-        zoom=2,
-        center={"lat": spatial_df['latitude'].mean(), "lon": spatial_df['longitude'].mean()},
-        title=f"Model Performance: {metric_choice} by Location",
-        size_max=30
+    # Line plot showing predicted SPEI over time
+    fig_temporal = px.line(
+        df_time,
+        x='time',
+        y='y_pred',
+        color='location',
+        hover_data={
+            'latitude': ':.2f',
+            'longitude': ':.2f',
+            'y_true': ':.4f',
+            'y_pred': ':.4f',
+            'time': '|%Y-%m-%d'
+        },
+        title='Spatial-Temporal Analysis: Predicted SPEI Over Time by Location',
+        labels={'time': 'Date', 'y_pred': 'Predicted SPEI', 'location': 'Location'},
+        height=700
     )
-    fig.update_layout(mapbox_style="open-street-map", height=700)
-    st.plotly_chart(fig, use_container_width=True)
-    
-    # Spatial statistics
-    st.subheader("📊 Spatial Statistics")
-    col1, col2, col3, col4 = st.columns(4)
-    
-    col1.metric("Highest RMSE", f"{spatial_df['RMSE'].max():.4f}")
-    col2.metric("Lowest RMSE", f"{spatial_df['RMSE'].min():.4f}")
-    col3.metric("Mean RMSE", f"{spatial_df['RMSE'].mean():.4f}")
-    col4.metric("Std Dev RMSE", f"{spatial_df['RMSE'].std():.4f}")
-    
-    st.dataframe(
-        spatial_df.sort_values('RMSE'),
-        use_container_width=True,
-        hide_index=True
+    fig_temporal.update_layout(
+        hovermode='x unified',
+        template='plotly_white',
+        legend=dict(yanchor='top', y=0.99, xanchor='left', x=0.01, bgcolor='rgba(255,255,255,0.8)')
     )
+    st.plotly_chart(fig_temporal, use_container_width=True)
+    
+    st.info("""
+    💡 **How to interpret:**
+    - **Each line = one location (lat/lon)**
+    - **Y-axis**: Predicted SPEI value
+    - **X-axis**: Time (from 2019 to present)
+    - **Hover**: Shows latitude, longitude, actual SPEI, predicted SPEI, and date
+    - **Patterns**: Compare SPEI trends across different geographic locations over time
+    """)
 
 # =========================================================
 # PAGE 5: QUICK COMPARISON
@@ -1041,6 +1409,7 @@ elif page == "🔮 Make Predictions":
         "🤖 Select Model",
         [
             "Early – LSTM",
+            "Early – XGBoost",
             "Intermediate – LSTM+TCN",
             "Intermediate – GRU+CNN (Gated)",
             "Late – Meta",
@@ -1051,6 +1420,7 @@ elif page == "🔮 Make Predictions":
     # Map to model paths
     model_paths = {
         "Early – LSTM": MODELS_DIR / "early" / "lstm_early_fusion.keras",
+        "Early – XGBoost": MODELS_DIR / "early" / "xgboost_early_fusion.pkl",
         "Intermediate – LSTM+TCN": MODELS_DIR / "intermediate" / "lstm_tcn_intermediate.keras",
         "Intermediate – GRU+CNN (Gated)": MODELS_DIR / "intermediate" / "gru_cnn_gated_intermediate.keras",
         "Late – Meta": MODELS_DIR / "late" / "earth_lstm.keras",  # Example
@@ -1060,174 +1430,215 @@ elif page == "🔮 Make Predictions":
     model_path = model_paths.get(model_select)
     
     st.markdown("---")
-    
-    st.subheader("📥 Input Features")
-    st.info("""
-    Enter the feature values for SPEI prediction:
-    - **Earth Observation**: Satellite-derived indices (typically normalized -2 to 2)
-    - **ERA5 Climate**: Reanalysis climate variables (typically normalized -3 to 3)
-    """)
-    
-    # Feature input columns
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.subheader("🛰️ Earth Observation Features")
-        eo_ndvi = st.slider("NDVI (Vegetation Index)", -1.0, 1.0, 0.5, 0.01, help="Normalized Difference Vegetation Index")
-        eo_lst = st.slider("Land Surface Temp", -3.0, 3.0, 0.0, 0.1, help="Normalized Land Surface Temperature")
-        eo_sm = st.slider("Soil Moisture", -2.0, 2.0, 0.0, 0.1, help="Normalized Soil Moisture")
-        eo_lai = st.slider("Leaf Area Index", -2.0, 2.0, 0.0, 0.1, help="Normalized LAI")
-    
-    with col2:
-        st.subheader("📊 ERA5 Climate Features")
-        era_temp = st.slider("Temperature (2m)", -3.0, 3.0, 0.0, 0.1, help="Normalized 2m Temperature")
-        era_precip = st.slider("Precipitation", -2.0, 3.0, 0.0, 0.1, help="Normalized Precipitation")
-        era_pressure = st.slider("Surface Pressure", -2.0, 2.0, 0.0, 0.1, help="Normalized Pressure")
-        era_wind = st.slider("Wind Speed", -2.0, 2.0, 0.0, 0.1, help="Normalized Wind Speed")
-    
-    with col3:
-        st.subheader("📍 Geospatial Info")
-        latitude = st.number_input("Latitude", -90.0, 90.0, 14.9, 0.1)
-        longitude = st.number_input("Longitude", -180.0, 180.0, 76.9, 0.1)
-        month = st.selectbox("Month", list(range(1, 13)), format_func=lambda x: ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][x-1])
-        year = st.number_input("Year", 2015, 2025, 2023, 1)
-    
-    st.markdown("---")
-    
-    # Prepare features
-    features = np.array([
-        [eo_ndvi, eo_lst, eo_sm, eo_lai,
-         era_temp, era_precip, era_pressure, era_wind]
-    ])
-    
-    # Make prediction button
-    col_pred1, col_pred2, col_pred3 = st.columns([1, 1, 2])
-    
-    with col_pred1:
-        predict_btn = st.button("🚀 Get Prediction", use_container_width=True)
-    
-    with col_pred2:
-        clear_btn = st.button("🔄 Reset", use_container_width=True)
-    
-    if clear_btn:
-        st.rerun()
-    
-    if predict_btn:
-        # Try to load and use model
-        model = load_model(model_path)
-        
-        if model is None:
-            st.warning(f"⚠️ Model file not found at: {model_path}")
-            st.info("""
-            For now, showing simulated prediction based on input features.
-            To use actual models, ensure they are saved in the models directory.
-            """)
-            # Simulate prediction
-            pred_spei = eo_ndvi * 0.3 + era_precip * 0.25 - era_temp * 0.15 + eo_sm * 0.2 + np.random.normal(0, 0.3)
+
+    # If user selected Early - XGBoost, show form-based inputs and use joblib model
+    if model_select == "Early – XGBoost":
+        xgb_model_path = MODELS_DIR / "early" / "xgboost_early_fusion.pkl"
+        feat_path = MODELS_DIR / "early" / "feature_names.pkl"
+        xgb_model = load_xgb_model(xgb_model_path)
+        feature_names = load_feature_names(feat_path)
+
+        if xgb_model is None or feature_names is None:
+            st.warning("⚠️ XGBoost model or feature names not found. Please run the training script first (train_early_fusion.py).")
         else:
-            try:
-                # Reshape for model input
-                features_reshaped = features.reshape(1, -1)
-                pred_spei = model.predict(features_reshaped, verbose=0)[0][0]
-            except Exception as e:
-                st.error(f"Error during prediction: {str(e)}")
-                pred_spei = None
-        
-        if pred_spei is not None:
-            st.markdown("---")
-            
-            # Display prediction
-            col_display1, col_display2 = st.columns([1.5, 1])
-            
-            with col_display1:
-                st.subheader("🎯 SPEI Prediction Result")
-                
-                # Color code based on SPEI value
-                if pred_spei > 1.5:
-                    condition = "🟢 Extremely Wet"
-                    color = "green"
-                elif pred_spei > 1.0:
-                    condition = "🟦 Very Wet"
-                    color = "lightblue"
-                elif pred_spei > 0.5:
-                    condition = "🟩 Moderately Wet"
-                    color = "lightgreen"
-                elif pred_spei > -0.5:
-                    condition = "🟨 Near Normal"
-                    color = "yellow"
-                elif pred_spei > -1.0:
-                    condition = "🟧 Moderately Dry"
-                    color = "orange"
-                elif pred_spei > -1.5:
-                    condition = "🟥 Severely Dry"
-                    color = "red"
+            st.subheader("📥 Input Features (Early - XGBoost)")
+            st.info("Enter exact values for each feature; press Predict when ready.")
+
+            # Form for inputs
+            with st.form(key="xgb_predict_form"):
+                cols = st.columns(3)
+                xgb_inputs = {}
+                for idx, feat in enumerate(feature_names):
+                    with cols[idx % 3]:
+                        xgb_inputs[feat] = st.text_input(feat, value="0.0", key=f"xgb_{idx}")
+
+                submit_xgb = st.form_submit_button("🔮 Predict SPEI6")
+
+            if submit_xgb:
+                # convert and predict
+                try:
+                    converted = {}
+                    for k, v in xgb_inputs.items():
+                        converted[k] = float(v)
+                except ValueError as e:
+                    st.error(f"Invalid numeric input: {e}")
                 else:
-                    condition = "⬛ Extremely Dry"
-                    color = "darkred"
-                
-                st.markdown(f"""
-                <div style="background-color: {color}; padding: 20px; border-radius: 10px; text-align: center;">
-                    <h2>SPEI Value: {pred_spei:.3f}</h2>
-                    <h3>{condition}</h3>
-                </div>
-                """, unsafe_allow_html=True)
-                
-                st.markdown("""
-                **SPEI Scale Interpretation:**
-                - **> 1.5**: Extremely Wet
-                - **1.0 to 1.5**: Very Wet
-                - **0.5 to 1.0**: Moderately Wet
-                - **-0.5 to 0.5**: Near Normal
-                - **-1.0 to -0.5**: Moderately Dry
-                - **-1.5 to -1.0**: Severely Dry
-                - **< -1.5**: Extremely Dry
+                    input_df = pd.DataFrame([converted])[feature_names]
+                    try:
+                        pred = xgb_model.predict(input_df)[0]
+                        st.success("✓ Prediction successful!")
+                        st.metric("Predicted SPEI6", f"{pred:.4f}")
+                    except Exception as e:
+                        st.error(f"Prediction failed: {e}")
+
+    else:
+        st.subheader("📥 Input Features")
+        st.info("""
+        Enter the feature values for SPEI prediction:
+        - **Earth Observation**: Satellite-derived indices (typically normalized -2 to 2)
+        - **ERA5 Climate**: Reanalysis climate variables (typically normalized -3 to 3)
+        """)
+
+        # Feature input columns
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            st.subheader("🛰️ Earth Observation Features")
+            eo_ndvi = st.slider("NDVI (Vegetation Index)", -1.0, 1.0, 0.5, 0.01, help="Normalized Difference Vegetation Index")
+            eo_lst = st.slider("Land Surface Temp", -3.0, 3.0, 0.0, 0.1, help="Normalized Land Surface Temperature")
+            eo_sm = st.slider("Soil Moisture", -2.0, 2.0, 0.0, 0.1, help="Normalized Soil Moisture")
+            eo_lai = st.slider("Leaf Area Index", -2.0, 2.0, 0.0, 0.1, help="Normalized LAI")
+
+        with col2:
+            st.subheader("📊 ERA5 Climate Features")
+            era_temp = st.slider("Temperature (2m)", -3.0, 3.0, 0.0, 0.1, help="Normalized 2m Temperature")
+            era_precip = st.slider("Precipitation", -2.0, 3.0, 0.0, 0.1, help="Normalized Precipitation")
+            era_pressure = st.slider("Surface Pressure", -2.0, 2.0, 0.0, 0.1, help="Normalized Pressure")
+            era_wind = st.slider("Wind Speed", -2.0, 2.0, 0.0, 0.1, help="Normalized Wind Speed")
+
+        with col3:
+            st.subheader("📍 Geospatial Info")
+            latitude = st.number_input("Latitude", -90.0, 90.0, 14.9, 0.1)
+            longitude = st.number_input("Longitude", -180.0, 180.0, 76.9, 0.1)
+            month = st.selectbox("Month", list(range(1, 13)), format_func=lambda x: ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][x-1])
+            year = st.number_input("Year", 2015, 2025, 2023, 1)
+        
+        st.markdown("---")
+        
+        # Prepare features
+        features = np.array([
+            [eo_ndvi, eo_lst, eo_sm, eo_lai,
+             era_temp, era_precip, era_pressure, era_wind]
+        ])
+        
+        # Make prediction button
+        col_pred1, col_pred2, col_pred3 = st.columns([1, 1, 2])
+        
+        with col_pred1:
+            predict_btn = st.button("🚀 Get Prediction", use_container_width=True)
+        
+        with col_pred2:
+            clear_btn = st.button("🔄 Reset", use_container_width=True)
+        
+        if clear_btn:
+            st.rerun()
+        
+        if predict_btn:
+            # Try to load and use model
+            model = load_model(model_path)
+            
+            if model is None:
+                st.warning(f"⚠️ Model file not found at: {model_path}")
+                st.info("""
+                For now, showing simulated prediction based on input features.
+                To use actual models, ensure they are saved in the models directory.
                 """)
+                # Simulate prediction
+                pred_spei = eo_ndvi * 0.3 + era_precip * 0.25 - era_temp * 0.15 + eo_sm * 0.2 + np.random.normal(0, 0.3)
+            else:
+                try:
+                    # Reshape for model input
+                    features_reshaped = features.reshape(1, -1)
+                    pred_spei = model.predict(features_reshaped, verbose=0)[0][0]
+                except Exception as e:
+                    st.error(f"Error during prediction: {str(e)}")
+                    pred_spei = None
             
-            with col_display2:
-                st.subheader("📊 Prediction Input Summary")
-                summary = {
-                    "Location": f"{latitude:.1f}°N, {longitude:.1f}°E",
-                    "Date": f"{month:02d}/{year}",
-                    "Model": model_select,
-                    "NDVI": f"{eo_ndvi:.2f}",
-                    "Soil Moisture": f"{eo_sm:.2f}",
-                    "Precipitation": f"{era_precip:.2f}",
-                    "Temperature": f"{era_temp:.2f}",
-                }
+            if pred_spei is not None:
+                st.markdown("---")
                 
-                summary_df = pd.DataFrame(list(summary.items()), columns=["Parameter", "Value"])
-                st.dataframe(summary_df, use_container_width=True, hide_index=True)
-            
-            # Visualization
-            st.markdown("---")
-            
-            st.subheader("📈 Feature Contribution Analysis")
-            
-            features_names = ["NDVI", "LST", "Soil Moisture", "LAI", "Temperature", "Precipitation", "Pressure", "Wind"]
-            features_values = features[0]
-            
-            fig = px.bar(
-                x=features_names,
-                y=np.abs(features_values),
-                color=features_values,
-                color_continuous_scale='RdBu',
-                title="Input Feature Values (Absolute Magnitude)",
-                labels={'y': 'Feature Value (Normalized)', 'x': 'Features'}
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # Historical comparison
-            st.markdown("---")
-            st.subheader("📚 Historical Context")
-            
-            # Load some sample data for context
-            sample_df = load_predictions(PREDICTION_FILES[list(PREDICTION_FILES.keys())[0]])
-            if sample_df is not None:
-                # Get predictions from same location if available
-                same_loc = sample_df[(sample_df['latitude'] == latitude) & (sample_df['longitude'] == longitude)]
-                if len(same_loc) > 0:
-                    avg_pred = same_loc['y_pred'].mean()
-                    st.info(f"💡 Average prediction at this location (historical): **{avg_pred:.3f}**")
+                # Display prediction
+                col_display1, col_display2 = st.columns([1.5, 1])
+                
+                with col_display1:
+                    st.subheader("🎯 SPEI Prediction Result")
+                    
+                    # Color code based on SPEI value
+                    if pred_spei > 1.5:
+                        condition = "🟢 Extremely Wet"
+                        color = "green"
+                    elif pred_spei > 1.0:
+                        condition = "🟦 Very Wet"
+                        color = "lightblue"
+                    elif pred_spei > 0.5:
+                        condition = "🟩 Moderately Wet"
+                        color = "lightgreen"
+                    elif pred_spei > -0.5:
+                        condition = "🟨 Near Normal"
+                        color = "yellow"
+                    elif pred_spei > -1.0:
+                        condition = "🟧 Moderately Dry"
+                        color = "orange"
+                    elif pred_spei > -1.5:
+                        condition = "🟥 Severely Dry"
+                        color = "red"
+                    else:
+                        condition = "⬛ Extremely Dry"
+                        color = "darkred"
+                    
+                    st.markdown(f"""
+                    <div style="background-color: {color}; padding: 20px; border-radius: 10px; text-align: center;">
+                        <h2>SPEI Value: {pred_spei:.3f}</h2>
+                        <h3>{condition}</h3>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    st.markdown("""
+                    **SPEI Scale Interpretation:**
+                    - **> 1.5**: Extremely Wet
+                    - **1.0 to 1.5**: Very Wet
+                    - **0.5 to 1.0**: Moderately Wet
+                    - **-0.5 to 0.5**: Near Normal
+                    - **-1.0 to -0.5**: Moderately Dry
+                    - **-1.5 to -1.0**: Severely Dry
+                    - **< -1.5**: Extremely Dry
+                    """)
+                
+                with col_display2:
+                    st.subheader("📊 Prediction Input Summary")
+                    summary = {
+                        "Location": f"{latitude:.1f}°N, {longitude:.1f}°E",
+                        "Date": f"{month:02d}/{year}",
+                        "Model": model_select,
+                        "NDVI": f"{eo_ndvi:.2f}",
+                        "Soil Moisture": f"{eo_sm:.2f}",
+                        "Precipitation": f"{era_precip:.2f}",
+                        "Temperature": f"{era_temp:.2f}",
+                    }
+                    
+                    summary_df = pd.DataFrame(list(summary.items()), columns=["Parameter", "Value"])
+                    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+                
+                # Visualization
+                st.markdown("---")
+                
+                st.subheader("📈 Feature Contribution Analysis")
+                
+                features_names = ["NDVI", "LST", "Soil Moisture", "LAI", "Temperature", "Precipitation", "Pressure", "Wind"]
+                features_values = features[0]
+                
+                fig = px.bar(
+                    x=features_names,
+                    y=np.abs(features_values),
+                    color=features_values,
+                    color_continuous_scale='RdBu',
+                    title="Input Feature Values (Absolute Magnitude)",
+                    labels={'y': 'Feature Value (Normalized)', 'x': 'Features'}
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Historical comparison
+                st.markdown("---")
+                st.subheader("📚 Historical Context")
+                
+                # Load some sample data for context
+                sample_df = load_predictions(PREDICTION_FILES[list(PREDICTION_FILES.keys())[0]])
+                if sample_df is not None:
+                    # Get predictions from same location if available
+                    same_loc = sample_df[(sample_df['latitude'] == latitude) & (sample_df['longitude'] == longitude)]
+                    if len(same_loc) > 0:
+                        avg_pred = same_loc['y_pred'].mean()
+                        st.info(f"💡 Average prediction at this location (historical): **{avg_pred:.3f}**")
                     
                     # Comparison chart
                     comparison_vals = [avg_pred, pred_spei]
